@@ -1,0 +1,37 @@
+<div class="search-box">
+        <input type="text" id="searchInput" placeholder="🔍 Пошук...">
+    </div>
+
+    <div class="tabs">
+        <button class="tab active" data-tab="chats">Чати</button>
+        <button class="tab" data-tab="users">Люди</button>
+    </div>
+
+    <div class="list" id="chatsList"></div>
+    <div class="list hidden" id="usersList"></div>
+</aside>
+
+<main class="chat-area hidden" id="chatArea">
+    <div class="chat-header">
+        <button class="back-btn" onclick="closeChat()">‹</button>
+        <div class="avatar avatar-sm" id="chatAvatar"></div>
+        <div>
+            <div class="chat-title" id="chatTitle"></div>
+            <div class="chat-subtitle" id="chatSubtitle"></div>
+        </div>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="typing-indicator hidden" id="typingIndicator"></div>
+    <div class="input-area">
+        <button class="icon-btn" onclick="document.getElementById('fileInput').click()">📎</button>
+        <input type="file" id="fileInput" hidden>
+        <input type="text" id="messageInput" placeholder="Повідомлення..." autocomplete="off">
+        <button class="icon-btn" id="voiceBtn">🎤</button>
+        <button class="send-btn" onclick="sendMessage()">➤</button>
+    </div>
+</main>
+
+<div class="empty-state" id="emptyState">
+    <div class="icon">💬</div>
+    <div>Оберіть чат, щоб почати</div>
+</div>
