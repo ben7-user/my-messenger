@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>{{ 'Реєстрація' if mode == 'register' else 'Вхід' }} — MyMessenger</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#667eea">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Messenger">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="auth-body">
+<div class="auth-container">
+    <h1>💬 MyMessenger</h1>
+    <p class="subtitle">{{ 'Створіть новий акаунт' if mode == 'register' else 'Увійдіть у свій акаунт' }}</p>
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+    <form method="POST">
+        <input type="text" name="username" placeholder="Ім'я користувача" required autofocus autocomplete="username">
+        <input type="password" name="password" placeholder="Пароль" required autocomplete="current-password">
+        <button type="submit">{{ 'Зареєструватися' if mode == 'register' else 'Увійти' }}</button>
+    </form>
+    <div class="link">
+        {% if mode == 'register' %}
+        Вже маєте акаунт? <a href="{{ url_for('login') }}">Увійти</a>
+        {% else %}
+        Немає акаунту? <a href="{{ url_for('register') }}">Зареєструватися</a>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>
