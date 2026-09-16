@@ -1,0 +1,391 @@
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_from_directory, abort
+from flask_socketio import SocketIO, emit, join_room
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.utils import secure_filename
+from datetime import datetime
+from PIL import Image
+import bcrypt
+import os
+import uuid
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'change-me-12345')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///messenger.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'uploads')
+AVATAR_DIR = os.path.join(UPLOAD_DIR, 'avatars')
+FILE_DIR = os.path.join(UPLOAD_DIR, 'files')
+VOICE_DIR = os.path.join(UPLOAD_DIR, 'voice')
+for d in (AVATAR_DIR, FILE_DIR, VOICE_DIR):
+    os.makedirs(d, exist_ok=True)
+
+ALLOWED_IMAGES = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+ALLOWED_FILES = {'pdf', 'txt', 'doc', 'docx', 'zip', 'mp3', 'mp4', 'png', 'jpg', 'jpeg', 'gif'}
+
+db = SQLAlchemy(app)
+socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=25_000_000, async_mode='eventlet')
+
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    avatar = db.Column(db.String(200), default=None)
+    bio = db.Column(db.String(200), default='')
+    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Chat(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), default=None)
+    is_group = db.Column(db.Boolean, default=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    members = db.relationship('ChatMember', backref='chat', cascade='all, delete-orphan')
+
+
+class ChatMember(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    chat_id = db.Column(db.Integer, db.ForeignKey('chat.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    user = db.relationship('User')
+    __table_args__ = (db.UniqueConstraint('chat_id', 'user_id'),)
+
+
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    chat_id = db.Column(db.Integer, db.ForeignKey('chat.id'), nullable=False)
+    sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    text = db.Column(db.Text, default='')
+    message_type = db.Column(db.String(20), default='text')
+    file_path = db.Column(db.String(300), default=None)
+    file_name = db.Column(db.String(300), default=None)
+    file_size = db.Column(db.Integer, default=0)
+    duration = db.Column(db.Float, default=0)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    is_read = db.Column(db.Boolean, default=False)
+    sender = db.relationship('User', foreign_keys=[sender_id])
+
+
+def hash_password(password):
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def check_password(password, hashed):
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+
+
+def get_or_create_private_chat(user_a, user_b):
+    subq = db.session.query(ChatMember.chat_id).filter(
+        ChatMember.user_id.in_([user_a, user_b])
+    ).group_by(ChatMember.chat_id).having(db.func.count(ChatMember.user_id) == 2).subquery()
+    chat = Chat.query.filter(Chat.is_group == False, Chat.id.in_(db.session.query(subq))).first()
+    if not chat:
+        chat = Chat(is_group=False, created_by=user_a)
+        db.session.add(chat)
+        db.session.flush()
+        db.session.add_all([
+            ChatMember(chat_id=chat.id, user_id=user_a),
+            ChatMember(chat_id=chat.id, user_id=user_b),
+        ])
+        db.session.commit()
+    return chat
+
+
+def chat_to_dict(chat, current_user_id):
+    members = [{'id': m.user.id, 'username': m.user.username, 'avatar': m.user.avatar} for m in chat.members]
+    if chat.is_group:
+        title = chat.name or 'Group'
+        avatar = None
+    else:
+        other = next((m for m in members if m['id'] != current_user_id), None)
+        title = other['username'] if other else 'Chat'
+        avatar = other['avatar'] if other else None
+    last_msg = Message.query.filter_by(chat_id=chat.id).order_by(Message.timestamp.desc()).first()
+    return {
+        'id': chat.id,
+        'is_group': chat.is_group,
+        'title': title,
+        'avatar': avatar,
+        'members': members,
+        'last_message': {'text': last_msg.text if last_msg else '', 'timestamp': last_msg.timestamp.isoformat() if last_msg else None} if last_msg else None,
+    }
+
+
+def serialize_msg(m):
+    return {
+        'id': m.id,
+        'chat_id': m.chat_id,
+        'sender_id': m.sender_id,
+        'sender_name': m.sender.username,
+        'text': m.text,
+        'type': m.message_type,
+        'file_path': m.file_path,
+        'file_name': m.file_name,
+        'file_size': m.file_size,
+        ' =duration': m.duration,
+        'timestamp': m.timestamp.strftime('%H:%M'),
+    }
+
+
+def allowed_file(filename, allowed):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed
+
+
+@app.route('/')
+def index():
+    return redirect(url_for('chat') if 'user_id' in session else url_for('login'))
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        if not username or len(password) < 4:
+            return render_template('index.html', error='Login and password min 4 chars', mode='register')
+        if User.query.filter_by(username=username).first():
+            return render_template('index.html', error='User already exists', mode='register')
+        user = User(username=username, password_hash=hash_password(password))
+        db.session.add(user)
+        db.session.commit()
+        session['user_id'] = user.id
+        session['username'] = user.username
+        return redirect(url_for('chat'))
+    return render_template('index.html', mode='register')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        user = User.query.filter_by(username=username).first()
+        if user and check_password(password, user.password_hash):
+            session['user_id'] = user.id
+            session['username'] = user.username
+            return redirect(url_for('chat'))
+        return render_template('index.html', error='Wrong login or password', mode='login')
+    return render_template('index.html', mode='login')
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
+@app.route('/chat')
+def chat():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    return render_template('chat.html', username=user.username, user_id=user.id, avatar=user.avatar or '', bio=user.bio or '')
+
+
+@app.route('/api/me')
+def api_me():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    u = User.query.get(session['user_id'])
+    return jsonify({'id': u.id, 'username': u.username, 'avatar': u.avatar, 'bio': u.bio})
+
+
+@app.route('/api/users')
+def api_users():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    users = User.query.filter(User.id != session['user_id']).all()
+    return jsonify([{'id': u.id, 'username': u.username, 'avatar': u.avatar, 'bio': u.bio} for u in users])
+
+
+@app.route('/api/chats')
+def api_chats():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    me = session['user_id']
+    chat_ids = [m.chat_id for m in ChatMember.query.filter_by(user_id=me).all()]
+    chats = Chat.query.filter(Chat.id.in_(chat_ids)).all()
+    return jsonify([chat_to_dict(c, me) for c in chats])
+
+
+@app.route('/api/chats/private', methods=['POST'])
+def api_create_private_chat():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    data = request.get_json() or {}
+    other = data.get('user_id')
+    if not other:
+        return jsonify({'error': 'no user_id'}), 400
+    chat = get_or_create_private_chat(session['user_id'], other)
+    return jsonify(chat_to_dict(chat, session['user_id']))
+
+
+@app.route('/api/chats/group', methods=['POST'])
+def api_create_group():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip() or 'Group'
+    member_ids = data.get('members', [])
+    me = session['user_id']
+    chat = Chat(name=name, is_group=True, created_by=me)
+    db.session.add(chat)
+    db.session.flush()
+    for uid in set(member_ids) | {me}:
+        if User.query.get(uid):
+            db.session.add(ChatMember(chat_id=chat.id, user_id=uid, is_admin=(uid == me)))
+    db.session.commit()
+    return jsonify(chat_to_dict(chat, me))
+
+
+@app.route('/api/chats/<int:chat_id>/messages')
+def api_messages(chat_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    me = session['user_id']
+    if not ChatMember.query.filter_by(chat_id=chat_id, user_id=me).first():
+        return jsonify({'error': 'forbidden'}), 403
+    msgs = Message.query.filter_by(chat_id=chat_id).order_by(Message.timestamp.asc()).all()
+    Message.query.filter_by(chat_id=chat_id, is_read=False).filter(Message.sender_id != me).update({'is_read': True})
+    db.session.commit()
+    return jsonify([{
+        'id': m.id,
+        'chat_id': m.chat_id,
+        'sender_id': m.sender_id,
+        'sender_name': m.sender.username,
+        'text': m.text,
+        'type': m.message_type,
+        'file_path': m.file_path,
+        'file_name': m.file_name,
+        'file_size': m.file_size,
+        'duration': m.duration,
+        'timestamp': m.timestamp.strftime('%H:%M'),
+        'is_read': m.is_read,
+    } for m in msgs])
+
+
+@app.route('/api/avatar', methods=['POST'])
+def api_upload_avatar():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    file = request.files.get('avatar')
+    if not file or not allowed_file(file.filename, ALLOWED_IMAGES):
+        return jsonify({'error': 'invalid'}), 400
+    filename = uuid.uuid4().hex + '.jpg'
+    path = os.path.join(AVATAR_DIR, filename)
+    img = Image.open(file.stream).convert('RGB')
+    img.thumbnail((256, 256))
+    img.save(path, 'JPEG', quality=85)
+    u = User.query.get(session['user_id'])
+    u.avatar = filename
+    db.session.commit()
+    return jsonify({'avatar': filename})
+
+
+@app.route('/api/upload', methods=['POST'])
+def api_upload_file():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    file = request.files.get('file')
+    if not file or not allowed_file(file.filename, ALLOWED_FILES):
+        return jsonify({'error': 'invalid'}), 400
+    safe = secure_filename(file.filename)
+    stored = uuid.uuid4().hex + '_' + safe
+    path = os.path.join(FILE_DIR, stored)
+    file.save(path)
+    return jsonify({'file_path': stored, 'file_name': safe, 'file_size': os.path.getsize(path)})
+
+
+@app.route('/api/voice', methods=['POST'])
+def api_upload_voice():
+    if 'user_id' not in session:
+        return jsonify({'error': 'unauthorized'}), 401
+    file = request.files.get('voice')
+    duration = float(request.form.get('duration', 0))
+    if not file:
+        return jsonify({'error': 'no file'}), 400
+    stored = uuid.uuid4().hex + '.webm'
+    file.save(os.path.join(VOICE_DIR, stored))
+    return jsonify({'file_path': stored, 'duration': duration})
+
+
+@app.route('/uploads/<path:subpath>')
+def uploaded_file(subpath):
+    if 'user_id' not in session:
+        abort(401)
+    return send_from_directory(UPLOAD_DIR, subpath)
+
+
+online_users = {}
+sid_by_user = {}
+
+
+@socketio.on('connect')
+def on_connect():
+    if 'user_id' not in session:
+        return
+    uid = session['user_id']
+    online_users[request.sid] = uid
+    sid_by_user.setdefault(uid, set()).add(request.sid)
+    for m in ChatMember.query.filter_by(user_id=uid).all():
+        join_room('chat_' + str(m.chat_id))
+    emit('user_status', {'user_id': uid, 'online': True}, broadcast=True)
+
+
+@socketio.on('disconnect')
+def on_disconnect():
+    uid = online_users.pop(request.sid, None)
+    if uid:
+        sid_by_user.get(uid, set()).discard(request.sid)
+        if not sid_by_user.get(uid):
+            u = User.query.get(uid)
+            if u:
+                u.last_seen = datetime.utcnow()
+                db.session.commit()
+            emit('user_status', {'user_id': uid, 'online': False}, broadcast=True)
+
+
+@socketio.on('send_message')
+def on_send_message(data):
+    if 'user_id' not in session:
+        return
+    me = session['user_id']
+    chat_id = data.get('chat_id')
+    text = (data.get('text') or '').strip()
+    mtype = data.get('type', 'text')
+    if not chat_id or not ChatMember.query.filter_by(chat_id=chat_id, user_id=me).first():
+        return
+    msg = Message(
+        chat_id=chat_id,
+        sender_id=me,
+        text=text,
+        message_type=mtype,
+        file_path=data.get('file_path'),
+        file_name=data.get('file_name'),
+        file_size=data.get('file_size', 0),
+        duration=data.get('duration', 0),
+    )
+    db.session.add(msg)
+    db.session.commit()
+    socketio.emit('new_message', serialize_msg(msg), room='chat_' + str(chat_id))
+
+
+@socketio.on('typing')
+def on_typing(data):
+    if 'user_id' not in session:
+        return
+    chat_id = data.get('chat_id')
+    if not chat_id:
+        return
+    emit('user_typing', {'chat_id': chat_id, 'user_id': session['user_id'], 'username': session['username']}, room='chat_' + str(chat_id), include_self=False)
+
+
+with app.app_context():
+    db.create_all()
+
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
